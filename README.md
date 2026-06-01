@@ -1,21 +1,21 @@
-# Elasticsearch-Zeit-Such-Agent für VS Code + GitHub Copilot
+# Elasticsearch Time-Search Agent for VS Code + GitHub Copilot
 
-Ein lokaler **MCP-Server** gibt GitHub Copilot (Agent Mode) drei Werkzeuge:
+A local **MCP server** gives GitHub Copilot (Agent Mode) three tools:
 
-1. `get_current_time` – holt die aktuelle Uhrzeit über eine Web-API und gibt sie lesbar zurück.
-2. `list_data_views` – listet die Kibana **Data Views** (früher Index Patterns) über `GET /api/data_views` auf, damit der Nutzer auswählen kann, in welchem gesucht wird.
-3. `search_elasticsearch` – durchsucht Elasticsearch nach manuell eingegebenen Stichwörtern.
+1. `get_current_time` – fetches the current time from a web API and returns it in a readable form.
+2. `list_data_views` – lists the Kibana **Data Views** (formerly Index Patterns) via `GET /api/data_views`, so the user can choose which one to search in.
+3. `search_elasticsearch` – searches Elasticsearch for manually entered keywords.
 
-Ein **Custom Agent** steuert den Ablauf (erst Zeit, dann Data-View-Auswahl, dann Suche). Jeder Lauf wird in `agent-run.log` im aktuellen Workspace protokolliert.
+A **custom agent** drives the workflow (time first, then data-view selection, then search). Every run is logged to `agent-run.log` in the current workspace.
 
 ---
 
-## 1. Dateien an die richtigen Stellen legen
+## 1. Put the files in the right places
 
-Lege die Dateien in deinen Projekt-Workspace, exakt so:
+Place the files in your project workspace, exactly like this:
 
 ```
-DEIN-WORKSPACE/
+YOUR-WORKSPACE/
 ├── es_agent_server.py
 ├── requirements.txt
 ├── .vscode/
@@ -25,20 +25,20 @@ DEIN-WORKSPACE/
         └── elasticsearch-zeit-suche.agent.md
 ```
 
-> **Ältere VS Code-Version?** Bis ca. März 2026 hießen Custom Agents noch „Custom Chat Modes". Wenn der Agent nicht auftaucht, benenne die Datei in
-> `.github/chatmodes/elasticsearch-zeit-suche.chatmode.md` um (Inhalt bleibt gleich).
+> **Older VS Code version?** Until around March 2026, custom agents were still called "Custom Chat Modes". If the agent does not show up, rename the file to
+> `.github/chatmodes/elasticsearch-zeit-suche.chatmode.md` (the content stays the same).
 
-## 2. Voraussetzungen
+## 2. Requirements
 
-- **VS Code** (aktuell) mit aktivem **GitHub Copilot** und eingeschaltetem **Agent Mode**.
-- **Python 3.10+** (`python --version` prüfen).
-- Erreichbares **Elasticsearch** (lokal oder remote).
-- Erreichbares **Kibana** (für die Data-View-Liste). Die ES-Zugangsdaten (API-Key bzw. Benutzer/Passwort) gelten auch für Kibana.
+- **VS Code** (current) with active **GitHub Copilot** and **Agent Mode** enabled.
+- **Python 3.10+** (check with `python --version`).
+- A reachable **Elasticsearch** (local or remote).
+- A reachable **Kibana** (for the data-view list). The ES credentials (API key or username/password) also apply to Kibana.
 
-## 3. Python-Abhängigkeiten installieren (venv empfohlen)
+## 3. Install Python dependencies (venv recommended)
 
 ```bash
-cd DEIN-WORKSPACE
+cd YOUR-WORKSPACE
 python -m venv .venv
 # Windows:
 .venv\Scripts\activate
@@ -48,46 +48,46 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## 4. `.vscode/mcp.json` anpassen
+## 4. Adjust `.vscode/mcp.json`
 
-- **`command`:** Steht auf `"python"`. Falls dein System nur `python3` kennt oder du ein venv nutzt, trage den vollen Interpreter-Pfad ein, z. B.
+- **`command`:** Set to `"python"`. If your system only knows `python3` or you use a venv, enter the full interpreter path, e.g.
   - Windows venv: `"${workspaceFolder}/.venv/Scripts/python.exe"`
   - macOS/Linux venv: `"${workspaceFolder}/.venv/bin/python"`
-- **`${workspaceFolder}`** sorgt dafür, dass die Logdatei im aktuell geöffneten Workspace landet – nicht anfassen.
+- **`${workspaceFolder}`** ensures the log file ends up in the currently opened workspace – don't touch it.
 
-### Authentifizierung
+### Authentication
 
-Beim **ersten Start** fragt VS Code sicher nach `ES_URL`, `KIBANA_URL` und `ES_API_KEY`.
+On the **first start**, VS Code securely prompts for `ES_URL`, `KIBANA_URL` and `ES_API_KEY`.
 
-- **API-Key (empfohlen):** Key eingeben, fertig.
-- **Benutzer/Passwort statt API-Key:** API-Key-Feld leer lassen und im `env`-Block ergänzen:
+- **API key (recommended):** enter the key, done.
+- **Username/password instead of an API key:** leave the API-key field empty and add to the `env` block:
   ```json
   "ES_USERNAME": "elastic",
-  "ES_PASSWORD": "DEIN-PASSWORT"
+  "ES_PASSWORD": "YOUR-PASSWORD"
   ```
-- **Selbstsigniertes Zertifikat (häufig bei lokalem ES 8/9 mit https):** im `env`-Block
+- **Self-signed certificate (common with local ES 8/9 over https):** in the `env` block
   ```json
   "ES_VERIFY_CERTS": "false"
   ```
-  oder einen CA-Pfad setzen: `"ES_CA_CERT": "/pfad/zu/http_ca.crt"`.
+  or set a CA path: `"ES_CA_CERT": "/path/to/http_ca.crt"`.
 
-## 5. Server starten
+## 5. Start the server
 
-Öffne `.vscode/mcp.json` in VS Code – über dem `"es-zeit-agent"`-Eintrag erscheint **Start**. Alternativ Command Palette → `MCP: List Servers` → starten, oder Fenster neu laden (`Developer: Reload Window`).
+Open `.vscode/mcp.json` in VS Code – a **Start** action appears above the `"es-zeit-agent"` entry. Alternatively, Command Palette → `MCP: List Servers` → start, or reload the window (`Developer: Reload Window`).
 
-Status/Fehler: Command Palette → `MCP: List Servers` → Server → **Show Output**.
+Status/errors: Command Palette → `MCP: List Servers` → server → **Show Output**.
 
-## 6. Agent auswählen und nutzen
+## 6. Select and use the agent
 
-1. Copilot Chat öffnen (`Ctrl/Cmd + Alt + I`).
-2. Im Chat-Eingabefeld oben von **Agent/Ask** auf **„elasticsearch-zeit-suche"** umschalten.
-3. **Tools prüfen:** Auf das **Tools-Symbol** klicken und sicherstellen, dass `get_current_time`, `list_data_views` und `search_elasticsearch` aktiviert sind.
-   - *Falls keine Tools erscheinen:* Im `.agent.md` die Zeile `tools: ['es-zeit-agent']` entfernen – dann erbt der Agent alle aktiven Tools.
-4. Starten mit z. B.: **„Los geht's"** – der Agent fragt dann nach Zeitzone und Stichwörtern.
+1. Open Copilot Chat (`Ctrl/Cmd + Alt + I`).
+2. In the chat input at the top, switch from **Agent/Ask** to **"elasticsearch-zeit-suche"**.
+3. **Check the tools:** click the **tools icon** and make sure `get_current_time`, `list_data_views` and `search_elasticsearch` are enabled.
+   - *If no tools appear:* remove the line `tools: ['es-zeit-agent']` in the `.agent.md` – the agent then inherits all active tools.
+4. Get started with, for example: **"Let's go"** – the agent then asks for the time zone and keywords.
 
-## 7. Wo landet das Log?
+## 7. Where does the log go?
 
-Im Workspace-Root als **`agent-run.log`** (Dateiname über `LOG_FILENAME` änderbar). Beispielzeilen:
+In the workspace root as **`agent-run.log`** (the filename can be changed via `LOG_FILENAME`). Example lines:
 
 ```
 2026-05-31 14:30:02 | INFO    | === Agent-Server gestartet | Workspace=... ===
@@ -97,15 +97,15 @@ Im Workspace-Root als **`agent-run.log`** (Dateiname über `LOG_FILENAME` änder
 
 ## 8. Troubleshooting
 
-| Problem | Lösung |
+| Problem | Solution |
 |---|---|
-| Agent erscheint nicht in der Liste | Dateipfad `.github/agents/…agent.md` prüfen; ältere VS Code → `.chatmode.md` (s. o.); Fenster neu laden. |
-| Server startet nicht / „command not found" | In `mcp.json` vollen Python-/venv-Pfad bei `command` eintragen. |
-| `ModuleNotFoundError: mcp` o. `elasticsearch` | `pip install -r requirements.txt` im selben Interpreter wie in `mcp.json`. |
-| Suche schlägt fehl | `ES_URL`/Zugangsdaten prüfen; bei https-Zertifikatsfehler `ES_VERIFY_CERTS=false`. |
-| Keine / fehlerhafte Data Views | `KIBANA_URL` prüfen (Kibana läuft meist auf Port `5601`); API-Key/Zugangsdaten müssen Kibana-Rechte haben; bei https-Zertifikatsfehler `ES_VERIFY_CERTS=false`. |
-| Uhrzeit kommt als „Systemzeit (Fallback)" | Zeit-API nicht erreichbar (Proxy/Firewall) – Agent nutzt automatisch die lokale Systemzeit. |
+| Agent does not appear in the list | Check the file path `.github/agents/…agent.md`; older VS Code → `.chatmode.md` (see above); reload the window. |
+| Server does not start / "command not found" | Enter the full Python/venv path for `command` in `mcp.json`. |
+| `ModuleNotFoundError: mcp` or `elasticsearch` | `pip install -r requirements.txt` in the same interpreter as in `mcp.json`. |
+| Search fails | Check `ES_URL`/credentials; on https certificate errors set `ES_VERIFY_CERTS=false`. |
+| No / faulty data views | Check `KIBANA_URL` (Kibana usually runs on port `5601`); the API key/credentials must have Kibana permissions; on https certificate errors set `ES_VERIFY_CERTS=false`. |
+| Time comes back as "system time (fallback)" | Time API not reachable (proxy/firewall) – the agent automatically uses the local system time. |
 
-## 9. Zeit-API anpassen (optional)
+## 9. Customize the time API (optional)
 
-Standard ist `timeapi.io` (ohne API-Key). Eine andere API kannst du per `TIME_API_URL` im `env`-Block setzen; passe dann ggf. die Feldnamen in `get_current_time` an.
+The default is `timeapi.io` (no API key). You can set a different API via `TIME_API_URL` in the `env` block; then adjust the field names in `get_current_time` if needed.
