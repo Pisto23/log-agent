@@ -1,5 +1,6 @@
 ---
 description: 'Fetches the current time via API and searches Elasticsearch for manually entered keywords. Logs every run to the workspace.'
+model: Claude Sonnet 4.6
 tools: ['es-log-agent']
 ---
 
