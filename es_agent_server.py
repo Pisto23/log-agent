@@ -1,27 +1,32 @@
 #!/usr/bin/env python3
 """
-MCP-Server: "Zeit + Elasticsearch-Stichwortsuche"
+MCP server: "Time + Elasticsearch keyword search"
 
-Wird von VS Code / GitHub Copilot (Agent Mode) als lokaler stdio-Server
-gestartet. Stellt Copilot zwei Werkzeuge bereit:
+Started by VS Code / GitHub Copilot (Agent Mode) as a local stdio server.
+Exposes three tools to Copilot:
 
-  1) get_current_time(timezone)      -> holt die aktuelle Uhrzeit ueber eine
-                                        Web-API und gibt sie lesbar zurueck.
-  2) search_elasticsearch(keywords)  -> durchsucht Elasticsearch nach den
-                                        (manuell eingegebenen) Stichwoertern.
+  1) get_current_time(timezone)       -> fetches the current time from a web API
+                                         and returns it in a readable form.
+  2) list_indices(include_system)     -> lists the available Elasticsearch
+                                         indices so the user can pick one.
+  3) search_elasticsearch(keywords)   -> searches Elasticsearch for the
+                                         (manually entered) keywords.
 
-Jeder Aufruf wird zusaetzlich in eine Logdatei im aktuellen Workspace
-geschrieben (Standard: <workspace>/agent-run.log).
+Each search run is also written to a log file in the current workspace; the
+file name is built per run from the index pattern + timestamp
+(<workspace>/<index>-<timestamp>.log).
 
-Konfiguration erfolgt komplett ueber Umgebungsvariablen, die VS Code via
-.vscode/mcp.json setzt (siehe README).
+Configuration is done entirely through environment variables that VS Code sets
+via .vscode/mcp.json (see README).
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import logging.handlers
 import os
+import re
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -32,36 +37,35 @@ from elasticsearch import Elasticsearch
 from mcp.server.fastmcp import FastMCP
 
 # ---------------------------------------------------------------------------
-# Konfiguration (aus Umgebungsvariablen, gesetzt durch .vscode/mcp.json)
+# Configuration (from environment variables, set by .vscode/mcp.json)
 # ---------------------------------------------------------------------------
 WORKSPACE_DIR = Path(os.environ.get("WORKSPACE_DIR", os.getcwd()))
-LOG_FILE = WORKSPACE_DIR / os.environ.get("LOG_FILENAME", "agent-run.log")
 
 ES_URL = os.environ.get("ES_URL", "http://localhost:9200")
 ES_API_KEY = os.environ.get("ES_API_KEY") or None
 ES_USERNAME = os.environ.get("ES_USERNAME") or None
 ES_PASSWORD = os.environ.get("ES_PASSWORD") or None
-# Bei https mit selbstsignierten Zertifikaten ggf. auf "false" setzen.
+# For https with self-signed certificates, set this to "false" if needed.
 ES_VERIFY_CERTS = os.environ.get("ES_VERIFY_CERTS", "true").lower() != "false"
 ES_CA_CERT = os.environ.get("ES_CA_CERT") or None
 
-# Kostenlose Zeit-API ohne API-Key. Bei Bedarf ueberschreibbar.
+# Free time API without an API key. Overridable if needed.
 TIME_API_URL = os.environ.get(
     "TIME_API_URL", "https://timeapi.io/api/time/current/zone"
 )
 
 
 def _field_paths(env_name: str, default: str) -> list[list[str]]:
-    """Liest eine kommagetrennte Liste von Punkt-Pfaden (z. B.
-    'kubernetes.pod.name,pod') aus einer Env-Variablen und gibt sie als Liste
-    von Schluessel-Listen zurueck. Beim Formatieren gewinnt der erste Pfad,
-    der im Dokument tatsaechlich vorhanden ist."""
+    """Reads a comma-separated list of dotted paths (e.g.
+    'kubernetes.pod.name,pod') from an environment variable and returns it as a
+    list of key lists. When formatting, the first path that is actually present
+    in the document wins."""
     raw = os.environ.get(env_name, default)
     return [p.strip().split(".") for p in raw.split(",") if p.strip()]
 
 
-# Welche Felder pro Treffer angezeigt werden. Pro Logbestand ueberschreibbar,
-# falls die Dokumente anders aufgebaut sind (erster vorhandener Pfad gewinnt).
+# Which fields are shown per hit. Overridable per log store in case the
+# documents are shaped differently (the first present path wins).
 TIMESTAMP_PATHS = _field_paths("FIELD_TIMESTAMP", "@timestamp,timestamp,time")
 MESSAGE_PATHS = _field_paths(
     "FIELD_MESSAGE", "message,log.message,msg,event.original,event.action,action")
@@ -72,43 +76,76 @@ CLUSTER_PATHS = _field_paths(
 NAMESPACE_PATHS = _field_paths(
     "FIELD_NAMESPACE", "kubernetes.namespace,namespace")
 
-_WEEKDAYS_DE = {
-    "Monday": "Montag",
-    "Tuesday": "Dienstag",
-    "Wednesday": "Mittwoch",
-    "Thursday": "Donnerstag",
-    "Friday": "Freitag",
-    "Saturday": "Samstag",
-    "Sunday": "Sonntag",
-}
+# ---------------------------------------------------------------------------
+# Logging to a workspace file (NOT to stdout -> stdout is reserved for MCP!)
+# The file name is built per search run from index pattern + timestamp
+# (see _activate_log_file). Until then, records are buffered so that startup,
+# time and index messages still end up in the first file.
+# ---------------------------------------------------------------------------
+WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 
-# ---------------------------------------------------------------------------
-# Logging in die Workspace-Datei (NICHT nach stdout -> stdout ist fuer MCP!)
-# ---------------------------------------------------------------------------
-LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-logging.basicConfig(
-    filename=str(LOG_FILE),
-    filemode="a",
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-7s | %(message)s",
+_LOG_FORMATTER = logging.Formatter(
+    fmt="%(asctime)s | %(levelname)-7s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-    encoding="utf-8",
 )
-logger = logging.getLogger("es-zeit-agent")
 
-# Die Elasticsearch-Bibliothek loggt jeden HTTP-Request ("POST .../_search
-# [status:200 ...]"). Das macht die Datei unleserlich -> nur Warnungen behalten.
+logger = logging.getLogger("es-log-agent")
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
+# As long as no search has run yet (file name unknown), buffer the records.
+_log_buffer: logging.handlers.MemoryHandler | None = logging.handlers.MemoryHandler(
+    capacity=100_000, flushLevel=logging.CRITICAL)
+_log_buffer.setFormatter(_LOG_FORMATTER)
+logger.addHandler(_log_buffer)
+
+# The Elasticsearch library logs every HTTP request ("POST .../_search
+# [status:200 ...]"). That clutters the file -> keep warnings only.
 for _noisy in ("elasticsearch", "elastic_transport", "urllib3"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
-mcp = FastMCP("es-zeit-agent")
+# Characters allowed in the file name; everything else becomes '_'.
+_LOGFILE_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _activate_log_file(index: str) -> Path:
+    """Creates a log file '<index-pattern>-<timestamp>.log' in the workspace for
+    the current search run and redirects logging there. On the first call the
+    buffered startup messages are carried over into the file; every further
+    search run gets its own file.
+    """
+    global _log_buffer
+    safe = _LOGFILE_UNSAFE.sub("_", index).strip("._-") or "all-indices"
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    path = WORKSPACE_DIR / f"{safe}-{stamp}.log"
+
+    handler = logging.FileHandler(path, mode="a", encoding="utf-8")
+    handler.setFormatter(_LOG_FORMATTER)
+
+    # Detach previous targets: flush buffered records into the new file and
+    # close old file handlers, so each search gets its own file.
+    for existing in list(logger.handlers):
+        if isinstance(existing, logging.handlers.MemoryHandler):
+            existing.setTarget(handler)
+            existing.flush()
+            logger.removeHandler(existing)
+            existing.close()
+            _log_buffer = None
+        elif isinstance(existing, logging.FileHandler):
+            logger.removeHandler(existing)
+            existing.close()
+
+    logger.addHandler(handler)
+    return path
+
+mcp = FastMCP("es-log-agent")
 
 
 # ---------------------------------------------------------------------------
-# Hilfsfunktionen
+# Helper functions
 # ---------------------------------------------------------------------------
 def _es_client() -> Elasticsearch:
-    """Baut einen Elasticsearch-Client passend zur gewaehlten Authentifizierung."""
+    """Builds an Elasticsearch client matching the selected authentication."""
     kwargs: dict[str, Any] = {"hosts": [ES_URL], "request_timeout": 30}
     if ES_API_KEY:
         kwargs["api_key"] = ES_API_KEY
@@ -124,8 +161,8 @@ def _es_client() -> Elasticsearch:
 
 
 def _dig(src: Any, path: list[str]) -> Any:
-    """Folgt einem Punkt-Pfad (z. B. ['kubernetes', 'pod', 'name']) durch ein
-    verschachteltes Dict und gibt den Wert zurueck, sonst None."""
+    """Follows a dotted path (e.g. ['kubernetes', 'pod', 'name']) through a
+    nested dict and returns the value, otherwise None."""
     cur = src
     for key in path:
         if isinstance(cur, dict) and key in cur:
@@ -136,8 +173,8 @@ def _dig(src: Any, path: list[str]) -> Any:
 
 
 def _first(src: Any, paths: list[list[str]]) -> Any:
-    """Gibt den Wert des ersten Pfades zurueck, der im Dokument vorhanden und
-    nicht leer ist."""
+    """Returns the value of the first path that is present and non-empty in the
+    document."""
     for path in paths:
         value = _dig(src, path)
         if value not in (None, "", [], {}):
@@ -146,46 +183,46 @@ def _first(src: Any, paths: list[list[str]]) -> Any:
 
 
 def _short(value: Any, limit: int = 200) -> str:
-    """Macht einen Wert zu einer einzeiligen, auf 'limit' Zeichen begrenzten
-    Zeichenkette (Whitespace normalisiert)."""
+    """Turns a value into a single-line string capped at 'limit' characters
+    (whitespace normalized)."""
     text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
     text = " ".join(text.split())
     return text[:limit] + " …" if len(text) > limit else text
 
 
 def _format_hit(index: int, hit: dict[str, Any]) -> str:
-    """Formatiert einen einzelnen Treffer lesbar: Timestamp, Pod/Cluster und
-    Message in zwei Zeilen. Fehlende Felder werden mit '-' dargestellt; fehlt
-    ein Message-Feld, wird ersatzweise die kompakte Quelle gezeigt."""
+    """Formats a single hit readably: timestamp, pod/cluster and message in two
+    lines. Missing fields are shown as '-'; if no message field is present, the
+    compact source is shown instead."""
     src = hit.get("_source", {})
     ts = _first(src, TIMESTAMP_PATHS) or "-"
     pod = _first(src, POD_PATHS) or "-"
     cluster = _first(src, CLUSTER_PATHS) or "-"
     namespace = _first(src, NAMESPACE_PATHS)
     message = _first(src, MESSAGE_PATHS)
-    if message is None:  # kein bekanntes Message-Feld -> kompakte Quelle zeigen
+    if message is None:  # no known message field -> show the compact source
         message = src
 
-    ort = f"pod={pod} | cluster={cluster}"
+    location = f"pod={pod} | cluster={cluster}"
     if namespace:
-        ort += f" | ns={namespace}"
+        location += f" | ns={namespace}"
     return (
-        f"{index}. {ts}  [{ort}]\n"
+        f"{index}. {ts}  [{location}]\n"
         f"   {_short(message)}"
     )
 
 
 # ---------------------------------------------------------------------------
-# Werkzeug 1: Uhrzeit ueber API abfragen und lesbar formatieren
+# Tool 1: query the current time via API and format it readably
 # ---------------------------------------------------------------------------
 @mcp.tool()
 def get_current_time(timezone: str = "Europe/Berlin") -> str:
-    """Fragt die aktuelle Uhrzeit fuer eine Zeitzone ueber eine Web-API ab und
-    gibt sie in einem gut lesbaren deutschen Format zurueck.
+    """Queries the current time for a timezone via a web API and returns it in a
+    well-readable format.
 
     Args:
-        timezone: IANA-Zeitzone, z. B. 'Europe/Berlin', 'America/New_York',
-                  'Asia/Tokyo'. Standard ist 'Europe/Berlin'.
+        timezone: IANA timezone, e.g. 'Europe/Berlin', 'America/New_York',
+                  'Asia/Tokyo'. Defaults to 'Europe/Berlin'.
     """
     url = f"{TIME_API_URL}?{urllib.parse.urlencode({'timeZone': timezone})}"
     try:
@@ -193,41 +230,39 @@ def get_current_time(timezone: str = "Europe/Berlin") -> str:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
 
-        weekday = _WEEKDAYS_DE.get(data.get("dayOfWeek", ""), data.get("dayOfWeek", ""))
         readable = (
-            f"{weekday}, "
-            f"{int(data['day']):02d}.{int(data['month']):02d}.{int(data['year'])} "
-            f"um {int(data['hour']):02d}:{int(data['minute']):02d}:{int(data['seconds']):02d} Uhr "
+            f"{data.get('dayOfWeek', '')}, "
+            f"{int(data['year'])}-{int(data['month']):02d}-{int(data['day']):02d} "
+            f"{int(data['hour']):02d}:{int(data['minute']):02d}:{int(data['seconds']):02d} "
             f"({data.get('timeZone', timezone)})"
         )
-        source = "Zeit-API"
-    except Exception as exc:  # noqa: BLE001 - bewusster Fallback
+        source = "time API"
+    except Exception as exc:  # noqa: BLE001 - intentional fallback
         now = datetime.now().astimezone()
-        weekday = _WEEKDAYS_DE.get(now.strftime("%A"), now.strftime("%A"))
-        readable = now.strftime(f"{weekday}, %d.%m.%Y um %H:%M:%S Uhr (Systemzeit %Z)")
-        source = "Systemzeit (Fallback)"
-        logger.warning("Zeit-API fehlgeschlagen (%s) - Fallback auf Systemzeit.", exc)
+        readable = now.strftime("%A, %Y-%m-%d %H:%M:%S (system time %Z)")
+        source = "system time (fallback)"
+        logger.warning("Time API failed (%s) - falling back to system time.", exc)
 
-    logger.info("ZEIT-ABFRAGE  | quelle=%s | zeitzone=%s | ergebnis=%s",
+    logger.info("TIME-QUERY    | source=%s | timezone=%s | result=%s",
                 source, timezone, readable)
     return readable
 
 
 # ---------------------------------------------------------------------------
-# Werkzeug 2: Vorhandene Elasticsearch-Indizes auflisten
+# Tool 2: list the available Elasticsearch indices
 # ---------------------------------------------------------------------------
 @mcp.tool()
 def list_indices(include_system: bool = False) -> str:
-    """Listet die in Elasticsearch vorhandenen Indizes auf, damit der Nutzer
-    auswaehlen kann, in welchem gesucht werden soll.
+    """Lists the available Elasticsearch indices so the user can pick which one
+    to search in.
 
-    Gibt je Index den Namen, die Dokumentanzahl und die Speichergroesse zurueck.
-    Der gewaehlte Indexname (oder ein Muster wie 'logs-*') wird anschliessend als
-    'index' an search_elasticsearch uebergeben.
+    Returns the name, document count and store size per index. The chosen index
+    name (or a pattern such as 'logs-*') is then passed as 'index' to
+    search_elasticsearch.
 
     Args:
-        include_system: Wenn True, werden auch System-/Hidden-Indizes (Name
-                        beginnt mit '.') mit aufgelistet. Standard: False.
+        include_system: If True, system/hidden indices (names starting with
+                        '.') are listed too. Default: False.
     """
     try:
         es = _es_client()
@@ -238,32 +273,32 @@ def list_indices(include_system: bool = False) -> str:
             s="index",
         )
     except Exception as exc:  # noqa: BLE001
-        logger.error("INDIZES FEHLER | %s", exc)
-        return (f"Indizes konnten nicht geladen werden: {exc}\n"
-                f"Pruefe ES_URL und die Zugangsdaten in .vscode/mcp.json.")
+        logger.error("INDICES ERROR | %s", exc)
+        return (f"Could not load indices: {exc}\n"
+                f"Check ES_URL and the credentials in .vscode/mcp.json.")
 
     if not include_system:
         rows = [r for r in rows if not str(r.get("index", "")).startswith(".")]
 
     if not rows:
-        logger.info("INDIZES       | keine gefunden")
-        return "Keine Indizes gefunden."
+        logger.info("INDICES       | none found")
+        return "No indices found."
 
-    lines = [f"{len(rows)} Index/Indizes gefunden:"]
+    lines = [f"{len(rows)} index/indices found:"]
     for i, r in enumerate(rows, start=1):
         name = r.get("index", "")
         docs = r.get("docs.count", "?")
         size = r.get("store.size", "?")
-        lines.append(f"{i}. {name}  (Dokumente: {docs}, Groesse: {size})")
+        lines.append(f"{i}. {name}  (docs: {docs}, size: {size})")
 
     output = "\n".join(lines)
-    logger.info("INDIZES       | anzahl=%s | namen=%s",
+    logger.info("INDICES       | count=%s | names=%s",
                 len(rows), [r.get("index", "") for r in rows])
     return output
 
 
 # ---------------------------------------------------------------------------
-# Werkzeug 3: Elasticsearch nach Stichwoertern durchsuchen
+# Tool 3: search Elasticsearch for keywords
 # ---------------------------------------------------------------------------
 @mcp.tool()
 def search_elasticsearch(
@@ -271,17 +306,20 @@ def search_elasticsearch(
     index: str = "*",
     max_results: int = 10,
 ) -> str:
-    """Durchsucht Elasticsearch nach den angegebenen Stichwoertern und gibt die
-    Treffer als lesbare Liste zurueck.
+    """Searches Elasticsearch for the given keywords and returns the hits as a
+    readable list.
 
     Args:
-        keywords: Ein oder mehrere Stichwoerter, durch Leerzeichen getrennt.
-                  Diese werden exakt so verwendet, wie sie der Nutzer eingibt.
-        index: Das zu durchsuchende Index-Muster, in der Regel der vom Nutzer
-               aus list_indices gewaehlte Indexname oder ein Muster, z. B.
-               'logs-*'. Standard '*' = alle Indizes.
-        max_results: Maximale Trefferanzahl (Standard 10).
+        keywords: One or more keywords separated by spaces. They are used
+                  exactly as the user enters them.
+        index: The index pattern to search, usually the index name the user
+               picked from list_indices, or a pattern such as 'logs-*'.
+               Default '*' = all indices.
+        max_results: Maximum number of hits (default 10).
     """
+    log_path = _activate_log_file(index)
+    logger.info("LOGFILE       | %s", log_path)
+
     query = {
         "multi_match": {
             "query": keywords,
@@ -295,33 +333,32 @@ def search_elasticsearch(
         es = _es_client()
         result = es.search(index=index, query=query, size=max_results)
     except Exception as exc:  # noqa: BLE001
-        logger.error("ES-SUCHE FEHLER | keywords=%r | index=%s | %s",
+        logger.error("ES-SEARCH ERROR | keywords=%r | index=%s | %s",
                      keywords, index, exc)
-        return (f"Suche fehlgeschlagen: {exc}\n"
-                f"Pruefe ES_URL und die Zugangsdaten in .vscode/mcp.json.")
+        return (f"Search failed: {exc}\n"
+                f"Check ES_URL and the credentials in .vscode/mcp.json.")
 
     hits = result.get("hits", {}).get("hits", [])
     total_raw = result.get("hits", {}).get("total", {})
     total = total_raw.get("value", len(hits)) if isinstance(total_raw, dict) else total_raw
 
     lines = [
-        f"{total} Treffer fuer \u00bb{keywords}\u00ab "
-        f"(Index: {index}) \u2013 angezeigt werden {len(hits)}:"
+        f"{total} hits for \"{keywords}\" "
+        f"(index: {index}) – showing {len(hits)}:"
     ]
     for i, hit in enumerate(hits, start=1):
         lines.append(_format_hit(i, hit))
 
     output = "\n".join(lines)
-    logger.info("ES-SUCHE      | keywords=%r | index=%s | treffer=%s | angezeigt=%s",
+    logger.info("ES-SEARCH     | keywords=%r | index=%s | hits=%s | shown=%s",
                 keywords, index, total, len(hits))
-    logger.info("ES-ERGEBNIS   |\n%s", output)
+    logger.info("ES-RESULT     |\n%s", output)
     return output
 
 
 # ---------------------------------------------------------------------------
-# Start als stdio-Server (so startet VS Code den Prozess)
+# Start as a stdio server (this is how VS Code launches the process)
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    logger.info("=== Agent-Server gestartet | Workspace=%s | Logdatei=%s ===",
-                WORKSPACE_DIR, LOG_FILE)
+    logger.info("=== Agent server started | workspace=%s ===", WORKSPACE_DIR)
     mcp.run()
