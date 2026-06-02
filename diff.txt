@@ -1,0 +1,313 @@
+diff --git a/.github/agents/elasticsearch-time-search.agent.md b/.github/agents/elasticsearch-time-search.agent.md
+index d0c5b9f..5419b30 100644
+--- a/.github/agents/elasticsearch-time-search.agent.md
++++ b/.github/agents/elasticsearch-time-search.agent.md
+@@ -18,11 +18,21 @@ German input, and reply in the language the user writes in. Be concise.
+    Elasticsearch indices and let them pick one. Remember the **index name** of
+    the chosen entry – it is used as `index` in the next step.
+ 4. **Ask for keywords.** Ask the user for the keywords to search for. Optionally
+-   also: the maximum number of hits (default `10`).
+-5. **Search.** Call `search_elasticsearch` with the **exact** keywords the user
+-   gave, the chosen index name and the number of hits.
++   also: the maximum number of hits (default `10`). Determine the match mode:
++   - If the user places an operator between keywords (`AND`/`OR`, or German
++     `UND`/`ODER`) or signals it in words (`both`, `all of`, `alle`, `beide` →
++     AND; `any`, `either`, `eines von` → OR), use that mode.
++   - If several keywords are given with no operator at all, ask once whether
++     **all** keywords must match (AND) or **any** of them (OR).
++   - A single keyword needs no mode.
++5. **Search.** Call `search_elasticsearch` with the keywords the user gave, the
++   chosen index name and the number of hits. Set `match_all_keywords=true` for
++   AND, or leave it at its default `false` for OR. Strip only the recognized
++   operator word (`AND`/`OR`/`UND`/`ODER`) from the keyword string – it selects
++   the mode and must not be searched for; leave every other term unchanged.
+ 6. **Present the result.** Summarize the hits clearly (timestamp, pod/cluster,
+-   short message excerpt) and state the total number of hits.
++   short message excerpt), state the total number of hits, and note whether all
++   (AND) or any (OR) keywords were required.
+ 
+ # Rules
+ - All three tools are mandatory, in the order `get_current_time` **before**
+@@ -30,7 +40,9 @@ German input, and reply in the language the user writes in. Be concise.
+ - Do not pick the index yourself – let the user choose from the list. Do not
+   invent indices or index patterns.
+ - Do not alter the user's keywords (no synonyms, no spelling correction) unless
+-  the user explicitly asks for it.
++  the user explicitly asks for it. The only exception is a recognized `AND`/`OR`
++  (`UND`/`ODER`) operator, which sets the match mode and is removed from the
++  searched terms.
+ - Never guess or invent keywords or search hits. If the search returns 0 hits or
+   fails, say so clearly.
+ - The tools write the workspace log file automatically – you do not need to deal
+diff --git a/CLAUDE.md b/CLAUDE.md
+index e33a025..1ddc572 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -13,7 +13,7 @@ The whole system is three files that VS Code wires together:
+ - **[es_agent_server.py](es_agent_server.py)** — the entire server. Built with `FastMCP`; tools are registered via `@mcp.tool()` and the process starts with `mcp.run()` (stdio). Three tools:
+   - `get_current_time(timezone)` — fetches time from a web API (`timeapi.io`), falls back to system time on any failure.
+   - `list_indices(include_system)` — lists Elasticsearch indices via the ES client (`es.cat.indices(...)`), returning name, doc count, and store size. System/hidden indices (names starting with `.`) are filtered out unless `include_system=True`. The user picks one; its name feeds the search's `index`.
+-  - `search_elasticsearch(keywords, index, max_results)` — `multi_match` query across all fields (`fields: ["*"]`, `lenient: True`). Each hit is rendered by `_format_hit()` as two readable lines (`<timestamp>  [pod=… | cluster=… | ns=…]` then the message), not raw JSON. Which `_source` fields map to timestamp/message/pod/cluster/namespace is controlled by the `FIELD_*` env vars (see invariants); `_first()` picks the first present path, and the message falls back to the compact source when no message field matches.
++  - `search_elasticsearch(keywords, index, max_results)` — `multi_match` query across all fields (`fields: ["*"]`, `lenient: True`). Hits are rendered by `_format_hits()` as one aligned, pipe-separated table whose metadata columns (`# | timestamp | pod | cluster | namespace`) are width-padded per search run to line up like the log header, with the **full message** (no truncation) as the final column. Which `_source` fields map to timestamp/message/pod/cluster/namespace is controlled by the `FIELD_*` env vars (see invariants); `_first()` picks the first present path, `_one_line()` collapses a value to a single line keeping all its content, and the message falls back to the compact source when no message field matches.
+ - **[.vscode/mcp.json](.vscode/mcp.json)** — VS Code's MCP server registration. Prompts the user for `ES_URL` / `ES_API_KEY` and passes all config to the server via the `env` block. This is the *only* configuration mechanism.
+ - **[.github/agents/elasticsearch-time-search.agent.md](.github/agents/elasticsearch-time-search.agent.md)** — the custom agent. The `tools: ['es-log-agent']` frontmatter binds it to the server named in `mcp.json`.
+ 
+diff --git a/README.md b/README.md
+index e8f5ef0..1b10e3f 100644
+--- a/README.md
++++ b/README.md
+@@ -4,9 +4,9 @@ A local **MCP server** gives GitHub Copilot (Agent Mode) three tools:
+ 
+ 1. `get_current_time` – fetches the current time from a web API and returns it in a readable form.
+ 2. `list_indices` – lists the available Elasticsearch indices (name, doc count, store size) so the user can choose which one to search in. System/hidden indices (names starting with `.`) are hidden unless `include_system=true`.
+-3. `search_elasticsearch` – searches Elasticsearch for manually entered keywords and returns a readable hit list (timestamp, pod/cluster, message).
++3. `search_elasticsearch` – searches Elasticsearch for manually entered keywords and returns the hits as an aligned table (`# | timestamp | pod | cluster | namespace | message`, full message kept). Optional: an inclusive time range (`start_time`/`end_time`, ISO 8601 or date math like `now-1h`) and an AND/OR match mode (`match_all_keywords`).
+ 
+-A **custom agent** drives the workflow (time first, then index selection, then search). The agent understands both English and German input and replies in the user's language. Every search run is logged to a per-run file in the current workspace, named `<index>-<timestamp>.log`.
++A **custom agent** drives the workflow (time first, then index selection, then search). When several keywords are given, the agent recognizes `AND`/`OR` (German `UND`/`ODER`) operators – or asks once – to decide whether all or any keyword must match. The agent understands both English and German input and replies in the user's language. Every search run is logged to a per-run file in the current workspace, named `<index>-<timestamp>.log`.
+ 
+ ---
+ 
+@@ -83,6 +83,8 @@ Status/errors: Command Palette → `MCP: List Servers` → server → **Show Out
+ 3. **Check the tools:** click the **tools icon** and make sure `get_current_time`, `list_indices` and `search_elasticsearch` are enabled.
+    - *If no tools appear:* remove the line `tools: ['es-log-agent']` in the `.agent.md` – the agent then inherits all active tools.
+ 4. Get started with, for example: **"Let's go"** – the agent then asks for the timezone, lists the indices and asks for keywords.
++   - *Multiple keywords:* the agent applies your `AND`/`OR` (or `UND`/`ODER`) operator, or asks once whether **all** or **any** keyword must match.
++   - *Time range (optional):* if you mention a period (e.g. "last hour", "since 2026-06-01T08:00:00Z"), the search is restricted to that range on the configured timestamp field.
+ 
+ ## 7. Where does the log go?
+ 
+@@ -91,21 +93,29 @@ Into the workspace root, one file per search run named **`<index>-<timestamp>.lo
+ ```
+ 2026-05-31 14:30:02 | INFO    | === Agent server started | workspace=... ===
+ 2026-05-31 14:30:18 | INFO    | TIME-QUERY    | source=time API | timezone=Europe/Berlin | result=Saturday, 2026-05-31 14:30:18 (Europe/Berlin)
+-2026-05-31 14:30:41 | INFO    | ES-SEARCH     | keywords='error timeout' | index=logs-* | hits=23 | shown=10
++2026-05-31 14:30:40 | INFO    | LOGFILE       | .../logs-2026-05-31_14-30-40.log
++2026-05-31 14:30:41 | INFO    | ES-SEARCH     | keywords='error timeout' | match=any | index=logs-* | range=*..* | hits=23 | shown=10
++2026-05-31 14:30:41 | INFO    | ES-RESULT     |
++# | timestamp | pod | cluster | namespace | message
++...
+ ```
+ 
++(`match` is `any` for OR or `all` for AND; `range` shows the time bounds, `*` when unbounded. The full rendered result table is logged as `ES-RESULT`.)
++
+ ## 8. Hit display fields (optional)
+ 
+-`search_elasticsearch` renders each hit as `<timestamp>  [pod=… | cluster=… | ns=…]` followed by the message. Which `_source` fields are used is controlled by optional env vars in the `env` block (comma-separated dotted paths; the first present path wins). Defaults target ECS/Kubernetes logs:
++`search_elasticsearch` renders the hits as an aligned, pipe-separated table whose metadata columns (`# | timestamp | pod | cluster | namespace`) are width-padded per search run, with the full message (no truncation) as the final column. Which `_source` fields fill those columns is controlled by optional env vars in the `env` block (comma-separated dotted paths; the first present path wins). Defaults target ECS/Kubernetes logs:
+ 
+ | Env var | Default |
+ |---|---|
+ | `FIELD_TIMESTAMP` | `@timestamp,timestamp,time` |
+ | `FIELD_MESSAGE` | `message,log.message,msg,event.original,event.action,action` |
+ | `FIELD_POD` | `kubernetes.pod.name,pod.name,pod` |
+-| `FIELD_CLUSTER` | `kubernetes.cluster,kubernetes.canonical_cluster_name,cluster` |
++| `FIELD_CLUSTER` | `kubernetes.canonical_cluster_name,kubernetes.cluster,cluster` |
+ | `FIELD_NAMESPACE` | `kubernetes.namespace,namespace` |
+ 
++`FIELD_TIMESTAMP` also defines the field(s) the optional `start_time`/`end_time` range filter is applied to.
++
+ If no message field matches, the compact `_source` is shown instead.
+ 
+ ## 9. Troubleshooting
+diff --git a/es_agent_server.py b/es_agent_server.py
+index c86b44d..124c779 100644
+--- a/es_agent_server.py
++++ b/es_agent_server.py
+@@ -72,7 +72,7 @@ MESSAGE_PATHS = _field_paths(
+ POD_PATHS = _field_paths("FIELD_POD", "kubernetes.pod.name,pod.name,pod")
+ CLUSTER_PATHS = _field_paths(
+     "FIELD_CLUSTER",
+-    "kubernetes.cluster,kubernetes.canonical_cluster_name,cluster")
++    "kubernetes.canonical_cluster_name,kubernetes.cluster,cluster")
+ NAMESPACE_PATHS = _field_paths(
+     "FIELD_NAMESPACE", "kubernetes.namespace,namespace")
+ 
+@@ -182,34 +182,76 @@ def _first(src: Any, paths: list[list[str]]) -> Any:
+     return None
+ 
+ 
+-def _short(value: Any, limit: int = 200) -> str:
+-    """Turns a value into a single-line string capped at 'limit' characters
+-    (whitespace normalized)."""
++def _one_line(value: Any) -> str:
++    """Collapses a value into a single, whitespace-normalized line while keeping
++    its full content (no truncation), so each hit stays on one tidy table row."""
+     text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+-    text = " ".join(text.split())
+-    return text[:limit] + " …" if len(text) > limit else text
++    return " ".join(text.split())
+ 
+ 
+-def _format_hit(index: int, hit: dict[str, Any]) -> str:
+-    """Formats a single hit readably: timestamp, pod/cluster and message in two
+-    lines. Missing fields are shown as '-'; if no message field is present, the
+-    compact source is shown instead."""
++def _time_range_filter(start_time: str | None, end_time: str | None) -> dict[str, Any] | None:
++    """Builds an Elasticsearch filter that restricts hits to a time range.
++
++    Because the timestamp field is env-tunable (TIMESTAMP_PATHS may list several
++    candidate fields), a 'range' clause is built for each candidate path and the
++    clauses are OR-combined ('should' with minimum_should_match=1) — so a hit is
++    kept when any of its known timestamp fields falls in the range. Returns None
++    when neither bound is given (i.e. no time filtering)."""
++    bounds: dict[str, str] = {}
++    if start_time:
++        bounds["gte"] = start_time
++    if end_time:
++        bounds["lte"] = end_time
++    if not bounds:
++        return None
++
++    shoulds = [{"range": {".".join(path): dict(bounds)}} for path in TIMESTAMP_PATHS]
++    return {"bool": {"should": shoulds, "minimum_should_match": 1}}
++
++
++# Metadata columns shown per hit (in order); the message is always appended as
++# the final column. Widths are computed per search run so the fields line up
++# like the header rows at the top of the log file.
++_HIT_COLUMNS = ("timestamp", "pod", "cluster", "namespace")
++
++
++def _hit_values(hit: dict[str, Any]) -> dict[str, str]:
++    """Extracts the displayed fields from a single hit. Missing metadata becomes
++    '-'; the full message is kept (no truncation), falling back to the compact
++    source when no known message field is present."""
+     src = hit.get("_source", {})
+-    ts = _first(src, TIMESTAMP_PATHS) or "-"
+-    pod = _first(src, POD_PATHS) or "-"
+-    cluster = _first(src, CLUSTER_PATHS) or "-"
+-    namespace = _first(src, NAMESPACE_PATHS)
+     message = _first(src, MESSAGE_PATHS)
+     if message is None:  # no known message field -> show the compact source
+         message = src
++    return {
++        "timestamp": str(_first(src, TIMESTAMP_PATHS) or "-"),
++        "pod": str(_first(src, POD_PATHS) or "-"),
++        "cluster": str(_first(src, CLUSTER_PATHS) or "-"),
++        "namespace": str(_first(src, NAMESPACE_PATHS) or "-"),
++        "message": _one_line(message),
++    }
+ 
+-    location = f"pod={pod} | cluster={cluster}"
+-    if namespace:
+-        location += f" | ns={namespace}"
+-    return (
+-        f"{index}. {ts}  [{location}]\n"
+-        f"   {_short(message)}"
+-    )
++
++def _format_hits(hits: list[dict[str, Any]]) -> str:
++    """Renders all hits as an aligned, pipe-separated table (one row per hit)
++    matching the column style of the log header. The metadata columns are padded
++    to a common width; the full message follows as the last column."""
++    rows = [_hit_values(h) for h in hits]
++    num_w = max(len("#"), len(str(len(rows))))
++    widths = {
++        col: max([len(col)] + [len(r[col]) for r in rows]) for col in _HIT_COLUMNS
++    }
++
++    def render(num: str, r: dict[str, str]) -> str:
++        cells = " | ".join(f"{r[col]:<{widths[col]}}" for col in _HIT_COLUMNS)
++        return f"{num:>{num_w}} | {cells} | {r['message']}"
++
++    header = {col: col for col in _HIT_COLUMNS}
++    header["message"] = "message"
++    lines = [render("#", header)]
++    for i, r in enumerate(rows, start=1):
++        lines.append(render(str(i), r))
++    return "\n".join(lines)
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -305,6 +347,9 @@ def search_elasticsearch(
+     keywords: str,
+     index: str = "*",
+     max_results: int = 10,
++    start_time: str | None = None,
++    end_time: str | None = None,
++    match_all_keywords: bool = False,
+ ) -> str:
+     """Searches Elasticsearch for the given keywords and returns the hits as a
+     readable list.
+@@ -316,18 +361,44 @@ def search_elasticsearch(
+                picked from list_indices, or a pattern such as 'logs-*'.
+                Default '*' = all indices.
+         max_results: Maximum number of hits (default 10).
++        start_time: Optional lower bound (inclusive) of the time range. Accepts
++                    any Elasticsearch date format, e.g. an ISO 8601 timestamp
++                    '2026-06-01T08:00:00Z' or date math like 'now-1h'. The bound
++                    is applied to the configured timestamp field(s)
++                    (FIELD_TIMESTAMP).
++        end_time: Optional upper bound (inclusive) of the time range, same
++                  accepted formats as start_time. Either bound may be given on
++                  its own (open-ended range) or both together.
++        match_all_keywords: If False (default), a hit only needs to match one of
++                  the keywords (OR). If True, every keyword must appear in the
++                  document (AND), matched across all fields combined
++                  (cross_fields), so the keywords may appear in different fields.
+     """
+     log_path = _activate_log_file(index)
+     logger.info("LOGFILE       | %s", log_path)
+ 
+-    query = {
+-        "multi_match": {
+-            "query": keywords,
+-            "type": "best_fields",
+-            "fields": ["*"],
+-            "lenient": True,
+-        }
++    multi_match: dict[str, Any] = {
++        "query": keywords,
++        "fields": ["*"],
++        "lenient": True,
+     }
++    if match_all_keywords:
++        # AND: every keyword must appear somewhere in the document. cross_fields
++        # treats all fields as one combined field, so the keywords may be spread
++        # across different fields.
++        multi_match["type"] = "cross_fields"
++        multi_match["operator"] = "and"
++    else:
++        # OR (default): a hit needs to match only one of the keywords.
++        multi_match["type"] = "best_fields"
++    text_query = {"multi_match": multi_match}
++    time_filter = _time_range_filter(start_time, end_time)
++    if time_filter is not None:
++        query: dict[str, Any] = {
++            "bool": {"must": [text_query], "filter": [time_filter]}
++        }
++    else:
++        query = text_query
+ 
+     try:
+         es = _es_client()
+@@ -342,16 +413,19 @@ def search_elasticsearch(
+     total_raw = result.get("hits", {}).get("total", {})
+     total = total_raw.get("value", len(hits)) if isinstance(total_raw, dict) else total_raw
+ 
+-    lines = [
+-        f"{total} hits for \"{keywords}\" "
+-        f"(index: {index}) – showing {len(hits)}:"
+-    ]
+-    for i, hit in enumerate(hits, start=1):
+-        lines.append(_format_hit(i, hit))
++    range_label = ""
++    if time_filter is not None:
++        range_label = f" [{start_time or '*'} … {end_time or '*'}]"
++    mode_label = " [match: all keywords]" if match_all_keywords else ""
+ 
+-    output = "\n".join(lines)
+-    logger.info("ES-SEARCH     | keywords=%r | index=%s | hits=%s | shown=%s",
+-                keywords, index, total, len(hits))
++    summary = (
++        f"{total} hits for \"{keywords}\"{mode_label} "
++        f"(index: {index}{range_label}) – showing {len(hits)}:"
++    )
++    output = summary if not hits else f"{summary}\n{_format_hits(hits)}"
++    logger.info("ES-SEARCH     | keywords=%r | match=%s | index=%s | range=%s..%s | hits=%s | shown=%s",
++                keywords, "all" if match_all_keywords else "any",
++                index, start_time or "*", end_time or "*", total, len(hits))
+     logger.info("ES-RESULT     |\n%s", output)
+     return output
+ 

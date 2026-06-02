@@ -72,7 +72,7 @@ MESSAGE_PATHS = _field_paths(
 POD_PATHS = _field_paths("FIELD_POD", "kubernetes.pod.name,pod.name,pod")
 CLUSTER_PATHS = _field_paths(
     "FIELD_CLUSTER",
-    "kubernetes.cluster,kubernetes.canonical_cluster_name,cluster")
+    "kubernetes.canonical_cluster_name,kubernetes.cluster,cluster")
 NAMESPACE_PATHS = _field_paths(
     "FIELD_NAMESPACE", "kubernetes.namespace,namespace")
 
@@ -182,34 +182,76 @@ def _first(src: Any, paths: list[list[str]]) -> Any:
     return None
 
 
-def _short(value: Any, limit: int = 200) -> str:
-    """Turns a value into a single-line string capped at 'limit' characters
-    (whitespace normalized)."""
+def _one_line(value: Any) -> str:
+    """Collapses a value into a single, whitespace-normalized line while keeping
+    its full content (no truncation), so each hit stays on one tidy table row."""
     text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-    text = " ".join(text.split())
-    return text[:limit] + " …" if len(text) > limit else text
+    return " ".join(text.split())
 
 
-def _format_hit(index: int, hit: dict[str, Any]) -> str:
-    """Formats a single hit readably: timestamp, pod/cluster and message in two
-    lines. Missing fields are shown as '-'; if no message field is present, the
-    compact source is shown instead."""
+def _time_range_filter(start_time: str | None, end_time: str | None) -> dict[str, Any] | None:
+    """Builds an Elasticsearch filter that restricts hits to a time range.
+
+    Because the timestamp field is env-tunable (TIMESTAMP_PATHS may list several
+    candidate fields), a 'range' clause is built for each candidate path and the
+    clauses are OR-combined ('should' with minimum_should_match=1) — so a hit is
+    kept when any of its known timestamp fields falls in the range. Returns None
+    when neither bound is given (i.e. no time filtering)."""
+    bounds: dict[str, str] = {}
+    if start_time:
+        bounds["gte"] = start_time
+    if end_time:
+        bounds["lte"] = end_time
+    if not bounds:
+        return None
+
+    shoulds = [{"range": {".".join(path): dict(bounds)}} for path in TIMESTAMP_PATHS]
+    return {"bool": {"should": shoulds, "minimum_should_match": 1}}
+
+
+# Metadata columns shown per hit (in order); the message is always appended as
+# the final column. Widths are computed per search run so the fields line up
+# like the header rows at the top of the log file.
+_HIT_COLUMNS = ("timestamp", "pod", "cluster", "namespace")
+
+
+def _hit_values(hit: dict[str, Any]) -> dict[str, str]:
+    """Extracts the displayed fields from a single hit. Missing metadata becomes
+    '-'; the full message is kept (no truncation), falling back to the compact
+    source when no known message field is present."""
     src = hit.get("_source", {})
-    ts = _first(src, TIMESTAMP_PATHS) or "-"
-    pod = _first(src, POD_PATHS) or "-"
-    cluster = _first(src, CLUSTER_PATHS) or "-"
-    namespace = _first(src, NAMESPACE_PATHS)
     message = _first(src, MESSAGE_PATHS)
     if message is None:  # no known message field -> show the compact source
         message = src
+    return {
+        "timestamp": str(_first(src, TIMESTAMP_PATHS) or "-"),
+        "pod": str(_first(src, POD_PATHS) or "-"),
+        "cluster": str(_first(src, CLUSTER_PATHS) or "-"),
+        "namespace": str(_first(src, NAMESPACE_PATHS) or "-"),
+        "message": _one_line(message),
+    }
 
-    location = f"pod={pod} | cluster={cluster}"
-    if namespace:
-        location += f" | ns={namespace}"
-    return (
-        f"{index}. {ts}  [{location}]\n"
-        f"   {_short(message)}"
-    )
+
+def _format_hits(hits: list[dict[str, Any]]) -> str:
+    """Renders all hits as an aligned, pipe-separated table (one row per hit)
+    matching the column style of the log header. The metadata columns are padded
+    to a common width; the full message follows as the last column."""
+    rows = [_hit_values(h) for h in hits]
+    num_w = max(len("#"), len(str(len(rows))))
+    widths = {
+        col: max([len(col)] + [len(r[col]) for r in rows]) for col in _HIT_COLUMNS
+    }
+
+    def render(num: str, r: dict[str, str]) -> str:
+        cells = " | ".join(f"{r[col]:<{widths[col]}}" for col in _HIT_COLUMNS)
+        return f"{num:>{num_w}} | {cells} | {r['message']}"
+
+    header = {col: col for col in _HIT_COLUMNS}
+    header["message"] = "message"
+    lines = [render("#", header)]
+    for i, r in enumerate(rows, start=1):
+        lines.append(render(str(i), r))
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +347,9 @@ def search_elasticsearch(
     keywords: str,
     index: str = "*",
     max_results: int = 10,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    match_all_keywords: bool = False,
 ) -> str:
     """Searches Elasticsearch for the given keywords and returns the hits as a
     readable list.
@@ -316,18 +361,44 @@ def search_elasticsearch(
                picked from list_indices, or a pattern such as 'logs-*'.
                Default '*' = all indices.
         max_results: Maximum number of hits (default 10).
+        start_time: Optional lower bound (inclusive) of the time range. Accepts
+                    any Elasticsearch date format, e.g. an ISO 8601 timestamp
+                    '2026-06-01T08:00:00Z' or date math like 'now-1h'. The bound
+                    is applied to the configured timestamp field(s)
+                    (FIELD_TIMESTAMP).
+        end_time: Optional upper bound (inclusive) of the time range, same
+                  accepted formats as start_time. Either bound may be given on
+                  its own (open-ended range) or both together.
+        match_all_keywords: If False (default), a hit only needs to match one of
+                  the keywords (OR). If True, every keyword must appear in the
+                  document (AND), matched across all fields combined
+                  (cross_fields), so the keywords may appear in different fields.
     """
     log_path = _activate_log_file(index)
     logger.info("LOGFILE       | %s", log_path)
 
-    query = {
-        "multi_match": {
-            "query": keywords,
-            "type": "best_fields",
-            "fields": ["*"],
-            "lenient": True,
-        }
+    multi_match: dict[str, Any] = {
+        "query": keywords,
+        "fields": ["*"],
+        "lenient": True,
     }
+    if match_all_keywords:
+        # AND: every keyword must appear somewhere in the document. cross_fields
+        # treats all fields as one combined field, so the keywords may be spread
+        # across different fields.
+        multi_match["type"] = "cross_fields"
+        multi_match["operator"] = "and"
+    else:
+        # OR (default): a hit needs to match only one of the keywords.
+        multi_match["type"] = "best_fields"
+    text_query = {"multi_match": multi_match}
+    time_filter = _time_range_filter(start_time, end_time)
+    if time_filter is not None:
+        query: dict[str, Any] = {
+            "bool": {"must": [text_query], "filter": [time_filter]}
+        }
+    else:
+        query = text_query
 
     try:
         es = _es_client()
@@ -342,16 +413,19 @@ def search_elasticsearch(
     total_raw = result.get("hits", {}).get("total", {})
     total = total_raw.get("value", len(hits)) if isinstance(total_raw, dict) else total_raw
 
-    lines = [
-        f"{total} hits for \"{keywords}\" "
-        f"(index: {index}) – showing {len(hits)}:"
-    ]
-    for i, hit in enumerate(hits, start=1):
-        lines.append(_format_hit(i, hit))
+    range_label = ""
+    if time_filter is not None:
+        range_label = f" [{start_time or '*'} … {end_time or '*'}]"
+    mode_label = " [match: all keywords]" if match_all_keywords else ""
 
-    output = "\n".join(lines)
-    logger.info("ES-SEARCH     | keywords=%r | index=%s | hits=%s | shown=%s",
-                keywords, index, total, len(hits))
+    summary = (
+        f"{total} hits for \"{keywords}\"{mode_label} "
+        f"(index: {index}{range_label}) – showing {len(hits)}:"
+    )
+    output = summary if not hits else f"{summary}\n{_format_hits(hits)}"
+    logger.info("ES-SEARCH     | keywords=%r | match=%s | index=%s | range=%s..%s | hits=%s | shown=%s",
+                keywords, "all" if match_all_keywords else "any",
+                index, start_time or "*", end_time or "*", total, len(hits))
     logger.info("ES-RESULT     |\n%s", output)
     return output
 
