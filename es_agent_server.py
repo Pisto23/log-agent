@@ -350,6 +350,7 @@ def search_elasticsearch(
     start_time: str | None = None,
     end_time: str | None = None,
     match_all_keywords: bool = False,
+    exclude_keywords: str | None = None,
 ) -> str:
     """Searches Elasticsearch for the given keywords and returns the hits as a
     readable list.
@@ -373,6 +374,10 @@ def search_elasticsearch(
                   the keywords (OR). If True, every keyword must appear in the
                   document (AND), matched across all fields combined
                   (cross_fields), so the keywords may appear in different fields.
+        exclude_keywords: Optional space-separated terms to exclude (the "NOT"
+                  part, e.g. "error" but not "timeout"). Any hit matching ANY of
+                  these terms in any field is dropped (must_not). Leave empty for
+                  no exclusion.
     """
     log_path = _activate_log_file(index)
     logger.info("LOGFILE       | %s", log_path)
@@ -392,11 +397,33 @@ def search_elasticsearch(
         # OR (default): a hit needs to match only one of the keywords.
         multi_match["type"] = "best_fields"
     text_query = {"multi_match": multi_match}
-    time_filter = _time_range_filter(start_time, end_time)
-    if time_filter is not None:
-        query: dict[str, Any] = {
-            "bool": {"must": [text_query], "filter": [time_filter]}
+
+    # Optional exclusion: drop every hit that matches ANY of these terms (OR),
+    # e.g. search "error" but exclude "timeout".
+    exclude_query = None
+    if exclude_keywords and exclude_keywords.strip():
+        exclude_query = {
+            "multi_match": {
+                "query": exclude_keywords,
+                "fields": ["*"],
+                "lenient": True,
+                "type": "best_fields",
+                "operator": "or",
+            }
         }
+
+    time_filter = _time_range_filter(start_time, end_time)
+
+    # Wrap in a bool query only when a time filter or an exclusion is present;
+    # a plain keyword search stays a bare multi_match.
+    bool_clauses: dict[str, Any] = {}
+    if time_filter is not None:
+        bool_clauses["filter"] = [time_filter]
+    if exclude_query is not None:
+        bool_clauses["must_not"] = [exclude_query]
+    if bool_clauses:
+        bool_clauses["must"] = [text_query]
+        query: dict[str, Any] = {"bool": bool_clauses}
     else:
         query = text_query
 
@@ -417,14 +444,15 @@ def search_elasticsearch(
     if time_filter is not None:
         range_label = f" [{start_time or '*'} … {end_time or '*'}]"
     mode_label = " [match: all keywords]" if match_all_keywords else ""
+    exclude_label = f" [excluding: {exclude_keywords}]" if exclude_query is not None else ""
 
     summary = (
-        f"{total} hits for \"{keywords}\"{mode_label} "
+        f"{total} hits for \"{keywords}\"{mode_label}{exclude_label} "
         f"(index: {index}{range_label}) – showing {len(hits)}:"
     )
     output = summary if not hits else f"{summary}\n{_format_hits(hits)}"
-    logger.info("ES-SEARCH     | keywords=%r | match=%s | index=%s | range=%s..%s | hits=%s | shown=%s",
-                keywords, "all" if match_all_keywords else "any",
+    logger.info("ES-SEARCH     | keywords=%r | exclude=%r | match=%s | index=%s | range=%s..%s | hits=%s | shown=%s",
+                keywords, exclude_keywords or "", "all" if match_all_keywords else "any",
                 index, start_time or "*", end_time or "*", total, len(hits))
     logger.info("ES-RESULT     |\n%s", output)
     return output
