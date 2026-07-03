@@ -351,6 +351,7 @@ def search_elasticsearch(
     end_time: str | None = None,
     match_all_keywords: bool = False,
     exclude_keywords: str | None = None,
+    field_filters: dict[str, str] | None = None,
 ) -> str:
     """Searches Elasticsearch for the given keywords and returns the hits as a
     readable list.
@@ -378,6 +379,11 @@ def search_elasticsearch(
                   part, e.g. "error" but not "timeout"). Any hit matching ANY of
                   these terms in any field is dropped (must_not). Leave empty for
                   no exclusion.
+        field_filters: Optional exact field filters, like Kibana's "Add filter"
+                  (field 'is' value): a mapping of field name to the value that
+                  field must have, e.g. {"kubernetes.container.name": "alloy"}.
+                  Every filter must match in addition to the keywords (AND).
+                  Leave empty to search without field filters.
     """
     log_path = _activate_log_file(index)
     logger.info("LOGFILE       | %s", log_path)
@@ -414,11 +420,20 @@ def search_elasticsearch(
 
     time_filter = _time_range_filter(start_time, end_time)
 
-    # Wrap in a bool query only when a time filter or an exclusion is present;
+    # Optional exact field filters (Kibana "Add filter": field 'is' value).
+    # match_phrase gives exact-value semantics on keyword fields and phrase
+    # matching on text fields, mirroring Kibana's 'is' operator.
+    filter_clauses: list[dict[str, Any]] = []
+    if time_filter is not None:
+        filter_clauses.append(time_filter)
+    for field, value in (field_filters or {}).items():
+        filter_clauses.append({"match_phrase": {field: value}})
+
+    # Wrap in a bool query only when a filter or an exclusion is present;
     # a plain keyword search stays a bare multi_match.
     bool_clauses: dict[str, Any] = {}
-    if time_filter is not None:
-        bool_clauses["filter"] = [time_filter]
+    if filter_clauses:
+        bool_clauses["filter"] = filter_clauses
     if exclude_query is not None:
         bool_clauses["must_not"] = [exclude_query]
     if bool_clauses:
@@ -445,14 +460,19 @@ def search_elasticsearch(
         range_label = f" [{start_time or '*'} … {end_time or '*'}]"
     mode_label = " [match: all keywords]" if match_all_keywords else ""
     exclude_label = f" [excluding: {exclude_keywords}]" if exclude_query is not None else ""
+    filters_label = ""
+    if field_filters:
+        filters_label = " [filters: " + ", ".join(
+            f"{f}={v}" for f, v in field_filters.items()) + "]"
 
     summary = (
-        f"{total} hits for \"{keywords}\"{mode_label}{exclude_label} "
+        f"{total} hits for \"{keywords}\"{mode_label}{exclude_label}{filters_label} "
         f"(index: {index}{range_label}) – showing {len(hits)}:"
     )
     output = summary if not hits else f"{summary}\n{_format_hits(hits)}"
-    logger.info("ES-SEARCH     | keywords=%r | exclude=%r | match=%s | index=%s | range=%s..%s | hits=%s | shown=%s",
-                keywords, exclude_keywords or "", "all" if match_all_keywords else "any",
+    logger.info("ES-SEARCH     | keywords=%r | exclude=%r | filters=%r | match=%s | index=%s | range=%s..%s | hits=%s | shown=%s",
+                keywords, exclude_keywords or "", field_filters or {},
+                "all" if match_all_keywords else "any",
                 index, start_time or "*", end_time or "*", total, len(hits))
     logger.info("ES-RESULT     |\n%s", output)
     return output
