@@ -4,7 +4,7 @@ A local **MCP server** gives GitHub Copilot (Agent Mode) three tools:
 
 1. `get_current_time` – fetches the current time from a web API and returns it in a readable form.
 2. `list_indices` – lists the available Elasticsearch indices (name, doc count, store size) so the user can choose which one to search in. System/hidden indices (names starting with `.`) are hidden unless `include_system=true`.
-3. `search_elasticsearch` – searches Elasticsearch for manually entered keywords and returns the hits as an aligned table (`# | timestamp | pod | cluster | namespace | message`, full message kept). Optional: an inclusive time range (`start_time`/`end_time`, ISO 8601 or date math like `now-1h`), an AND/OR match mode (`match_all_keywords`), and exclusion terms (`exclude_keywords`) that drop any hit matching them (the "NOT" part).
+3. `search_elasticsearch` – searches Elasticsearch for manually entered keywords and returns the hits as an aligned table (`# | timestamp | pod | cluster | namespace | message`, full message kept). Optional: an inclusive time range (`start_time`/`end_time`, ISO 8601 or date math like `now-1h`), an AND/OR match mode (`match_all_keywords`), exclusion terms (`exclude_keywords`) that drop any hit matching them (the "NOT" part), and exact field filters (`field_filters`, like Kibana's "Add filter": field *is* value, e.g. `kubernetes.container.name = alloy`) that every hit must match.
 
 A **custom agent** drives the workflow (time first, then index selection, then search). When several keywords are given, the agent recognizes `AND`/`OR` (German `UND`/`ODER`) operators – or asks once – to decide whether all or any keyword must match, and `NOT`/`NICHT`/`OHNE`/`-term` markers to exclude terms. The agent understands both English and German input and replies in the user's language. Every search run is logged to a per-run file in the current workspace, named `<index>-<timestamp>.log`.
 
@@ -86,6 +86,7 @@ Status/errors: Command Palette → `MCP: List Servers` → server → **Show Out
    - *Multiple keywords:* the agent applies your `AND`/`OR` (or `UND`/`ODER`) operator, or asks once whether **all** or **any** keyword must match.
    - *Exclusion:* say e.g. *"error and not timeout"* or *"fehler ohne debug"* (also `NOT`/`NICHT`/`OHNE` or `-term`) to drop hits containing those terms.
    - *Time range (optional):* if you mention a period (e.g. "last hour", "since 2026-06-01T08:00:00Z"), the search is restricted to that range on the configured timestamp field.
+   - *Field filters (optional):* say e.g. *"only container alloy"* or *"kubernetes.namespace = ci"* to restrict the hits to documents where that field has exactly that value (like Kibana's "Add filter"). Without filters the keywords are searched across all fields as usual.
 
 ## 7. Where does the log go?
 
@@ -95,13 +96,13 @@ Into the workspace root, one file per search run named **`<index>-<timestamp>.lo
 2026-05-31 14:30:02 | INFO    | === Agent server started | workspace=... ===
 2026-05-31 14:30:18 | INFO    | TIME-QUERY    | source=time API | timezone=Europe/Berlin | result=Saturday, 2026-05-31 14:30:18 (Europe/Berlin)
 2026-05-31 14:30:40 | INFO    | LOGFILE       | .../logs-2026-05-31_14-30-40.log
-2026-05-31 14:30:41 | INFO    | ES-SEARCH     | keywords='error timeout' | match=any | index=logs-* | range=*..* | hits=23 | shown=10
+2026-05-31 14:30:41 | INFO    | ES-SEARCH     | keywords='error timeout' | exclude='' | filters={} | match=any | index=logs-* | range=*..* | hits=23 | shown=10
 2026-05-31 14:30:41 | INFO    | ES-RESULT     |
 # | timestamp | pod | cluster | namespace | message
 ...
 ```
 
-(`match` is `any` for OR or `all` for AND; `range` shows the time bounds, `*` when unbounded. The full rendered result table is logged as `ES-RESULT`.)
+(`match` is `any` for OR or `all` for AND; `range` shows the time bounds, `*` when unbounded; `exclude`/`filters` show the exclusion terms and field filters, empty when unused. The full rendered result table is logged as `ES-RESULT`.)
 
 ## 8. Hit display fields (optional)
 
