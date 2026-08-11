@@ -12,9 +12,9 @@ Exposes three tools to Copilot:
   3) search_elasticsearch(keywords)   -> searches Elasticsearch for the
                                          (manually entered) keywords.
 
-Each search run is also written to a log file in the current workspace; the
-file name is built per run from the index pattern + timestamp
-(<workspace>/<index>-<timestamp>.log).
+Each search run is also written to its own log file, grouped into one folder per
+index prefix below the log directory
+(<workspace>/logs/<index-prefix>/<index>-<timestamp>.log).
 
 Configuration is done entirely through environment variables that VS Code sets
 via .vscode/mcp.json (see README).
@@ -40,6 +40,9 @@ from mcp.server.fastmcp import FastMCP
 # Configuration (from environment variables, set by .vscode/mcp.json)
 # ---------------------------------------------------------------------------
 WORKSPACE_DIR = Path(os.environ.get("WORKSPACE_DIR", os.getcwd()))
+# Where the per-search log files go (one sub-folder per index prefix). Kept out
+# of the workspace root so the logs don't clutter the repository.
+LOG_DIR = Path(os.environ.get("LOG_DIR") or WORKSPACE_DIR / "logs")
 
 ES_URL = os.environ.get("ES_URL", "http://localhost:9200")
 ES_API_KEY = os.environ.get("ES_API_KEY") or None
@@ -77,12 +80,12 @@ NAMESPACE_PATHS = _field_paths(
     "FIELD_NAMESPACE", "kubernetes.namespace,namespace")
 
 # ---------------------------------------------------------------------------
-# Logging to a workspace file (NOT to stdout -> stdout is reserved for MCP!)
-# The file name is built per search run from index pattern + timestamp
-# (see _activate_log_file). Until then, records are buffered so that startup,
-# time and index messages still end up in the first file.
+# Logging to a file (NOT to stdout -> stdout is reserved for MCP!)
+# Each search run gets its own file below LOG_DIR, in a sub-folder named after
+# the index prefix (see _activate_log_file). Until the first search runs,
+# records are buffered so that startup, time and index messages still end up in
+# the first file.
 # ---------------------------------------------------------------------------
-WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 
 _LOG_FORMATTER = logging.Formatter(
     fmt="%(asctime)s | %(levelname)-7s | %(message)s",
@@ -104,20 +107,43 @@ logger.addHandler(_log_buffer)
 for _noisy in ("elasticsearch", "elastic_transport", "urllib3"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
-# Characters allowed in the file name; everything else becomes '_'.
+# Characters allowed in file/folder names; everything else becomes '_'.
 _LOGFILE_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
+# Trailing index-name parts that only identify a single rollover/date slice
+# (e.g. '*', '2026.08.10', '000001') and therefore don't belong to the prefix.
+_INDEX_SUFFIX_PART = re.compile(r"\A[\d.]*\Z|[*?]")
+
+
+def _sanitize(name: str) -> str:
+    """Turns an index pattern into something usable as a file/folder name."""
+    return _LOGFILE_UNSAFE.sub("_", name).strip("._-")
+
+
+def _index_prefix(index: str) -> str:
+    """Derives the folder name from an index pattern: its prefix, without the
+    date/rollover/wildcard part at the end ('artifactory-idcevo-*' and
+    'artifactory-idcevo-2026.08.10' both become 'artifactory-idcevo', 'ci-*'
+    becomes 'ci'). A comma-separated list is represented by its first entry."""
+    first = next((p for p in index.split(",") if p.strip()), "")
+    parts = first.strip().split("-")
+    while parts and _INDEX_SUFFIX_PART.search(parts[-1]):
+        parts.pop()
+    return _sanitize("-".join(parts)) or "all-indices"
 
 
 def _activate_log_file(index: str) -> Path:
-    """Creates a log file '<index-pattern>-<timestamp>.log' in the workspace for
-    the current search run and redirects logging there. On the first call the
-    buffered startup messages are carried over into the file; every further
-    search run gets its own file.
+    """Creates a log file '<index-pattern>-<timestamp>.log' for the current
+    search run, inside the '<LOG_DIR>/<index-prefix>' folder (created if
+    missing), and redirects logging there. On the first call the buffered
+    startup messages are carried over into the file; every further search run
+    gets its own file.
     """
     global _log_buffer
-    safe = _LOGFILE_UNSAFE.sub("_", index).strip("._-") or "all-indices"
+    safe = _sanitize(index) or "all-indices"
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    path = WORKSPACE_DIR / f"{safe}-{stamp}.log"
+    folder = LOG_DIR / _index_prefix(index)
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"{safe}-{stamp}.log"
 
     handler = logging.FileHandler(path, mode="a", encoding="utf-8")
     handler.setFormatter(_LOG_FORMATTER)
@@ -482,5 +508,6 @@ def search_elasticsearch(
 # Start as a stdio server (this is how VS Code launches the process)
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    logger.info("=== Agent server started | workspace=%s ===", WORKSPACE_DIR)
+    logger.info("=== Agent server started | workspace=%s | logs=%s ===",
+                WORKSPACE_DIR, LOG_DIR)
     mcp.run()

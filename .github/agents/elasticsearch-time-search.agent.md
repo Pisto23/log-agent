@@ -1,5 +1,5 @@
 ---
-description: 'Fetches the current time via API and searches Elasticsearch for manually entered keywords. Logs every run to the workspace.'
+description: 'Fetches the current time via API and searches Elasticsearch for manually entered keywords. Logs every run to a file per index.'
 model: Claude Sonnet 4.6
 tools: ['es-log-agent']
 ---
@@ -64,5 +64,5 @@ German input, and reply in the language the user writes in. Be concise.
 - Never invent field names or filter values for `field_filters` – use exactly
   what the user states. If the user names a filter without a clear field name,
   ask which field it refers to.
-- The tools write the workspace log file automatically – you do not need to deal
-  with it or mention it.
+- The tools write the log file automatically – you do not need to deal with it
+  or mention it.
