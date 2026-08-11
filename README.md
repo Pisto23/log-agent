@@ -6,7 +6,7 @@ A local **MCP server** gives GitHub Copilot (Agent Mode) three tools:
 2. `list_indices` – lists the available Elasticsearch indices (name, doc count, store size) so the user can choose which one to search in. System/hidden indices (names starting with `.`) are hidden unless `include_system=true`.
 3. `search_elasticsearch` – searches Elasticsearch for manually entered keywords and returns the hits as an aligned table (`# | timestamp | pod | cluster | namespace | message`, full message kept). Optional: an inclusive time range (`start_time`/`end_time`, ISO 8601 or date math like `now-1h`), an AND/OR match mode (`match_all_keywords`), exclusion terms (`exclude_keywords`) that drop any hit matching them (the "NOT" part), and exact field filters (`field_filters`, like Kibana's "Add filter": field *is* value, e.g. `kubernetes.container.name = alloy`) that every hit must match.
 
-A **custom agent** drives the workflow (time first, then index selection, then search). When several keywords are given, the agent recognizes `AND`/`OR` (German `UND`/`ODER`) operators – or asks once – to decide whether all or any keyword must match, and `NOT`/`NICHT`/`OHNE`/`-term` markers to exclude terms. The agent understands both English and German input and replies in the user's language. Every search run is logged to a per-run file in the current workspace, named `<index>-<timestamp>.log`.
+A **custom agent** drives the workflow (time first, then index selection, then search). When several keywords are given, the agent recognizes `AND`/`OR` (German `UND`/`ODER`) operators – or asks once – to decide whether all or any keyword must match, and `NOT`/`NICHT`/`OHNE`/`-term` markers to exclude terms. The agent understands both English and German input and replies in the user's language. Every search run is logged to a per-run file below the workspace's `logs/` folder, grouped per index prefix: `logs/<index-prefix>/<index>-<timestamp>.log`.
 
 ---
 
@@ -52,7 +52,7 @@ pip install -r requirements.txt
 - **`command`:** Point it at the interpreter that has the dependencies installed. With the venv from step 3:
   - Windows venv: `"${workspaceFolder}/.venv/Scripts/python.exe"`
   - macOS/Linux venv: `"${workspaceFolder}/.venv/bin/python"`
-- **`${workspaceFolder}`** ensures the log files end up in the currently opened workspace – don't touch it.
+- **`${workspaceFolder}`** ensures the log files end up in the currently opened workspace (in its `logs/` folder) – don't touch it. To write them somewhere else entirely, add `"LOG_DIR": "/absolute/path"` to the `env` block.
 
 ### Authentication
 
@@ -90,12 +90,22 @@ Status/errors: Command Palette → `MCP: List Servers` → server → **Show Out
 
 ## 7. Where does the log go?
 
-Into the workspace root, one file per search run named **`<index>-<timestamp>.log`** (e.g. `logs-2026-05-31_14-30-41.log`; an all-indices `*` search becomes `all-indices-…`). Startup, time and index messages are buffered and written into the first search's file. Example lines:
+Into the workspace's **`logs/`** folder (git-ignored, created on demand), one file per search run: **`logs/<index-prefix>/<index>-<timestamp>.log`**. The sub-folder is the index name without its trailing date/rollover/wildcard part, so all runs on the same log store land together:
 
 ```
-2026-05-31 14:30:02 | INFO    | === Agent server started | workspace=... ===
+logs/
+├── artifactory-idcevo/   ← index 'artifactory-idcevo-*' or 'artifactory-idcevo-2026.08.10'
+│   └── artifactory-idcevo-2026-05-31_14-30-41.log
+├── ci/                   ← index 'ci-*'
+└── all-indices/          ← index '*'
+```
+
+Set `LOG_DIR` in the `env` block of `mcp.json` to put the folder somewhere other than the workspace. Startup, time and index messages are buffered and written into the first search's file. Example lines:
+
+```
+2026-05-31 14:30:02 | INFO    | === Agent server started | workspace=... | logs=.../logs ===
 2026-05-31 14:30:18 | INFO    | TIME-QUERY    | source=time API | timezone=Europe/Berlin | result=Saturday, 2026-05-31 14:30:18 (Europe/Berlin)
-2026-05-31 14:30:40 | INFO    | LOGFILE       | .../logs-2026-05-31_14-30-40.log
+2026-05-31 14:30:40 | INFO    | LOGFILE       | .../logs/logs/logs-2026-05-31_14-30-40.log
 2026-05-31 14:30:41 | INFO    | ES-SEARCH     | keywords='error timeout' | exclude='' | filters={} | match=any | index=logs-* | range=*..* | hits=23 | shown=10
 2026-05-31 14:30:41 | INFO    | ES-RESULT     |
 # | timestamp | pod | cluster | namespace | message
